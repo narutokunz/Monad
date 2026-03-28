@@ -257,7 +257,7 @@ export default function App() {
 
   /* ── Render ─────────────────────────────────────────────── */
   return (
-    <div className="flex flex-col min-h-screen bg-bg text-primary font-sans">
+    <div className="flex flex-col min-h-screen bg-white text-black font-sans">
 
       {walletModal && (
         <WalletModal
@@ -312,18 +312,20 @@ export default function App() {
       </main>
 
       {/* ── Status bar ── */}
-      <footer className="flex justify-between items-center px-7 py-2 border-t border-border flex-shrink-0">
-        <span className="flex items-center gap-[6px] font-mono text-[10px] text-muted">
+      <footer className="flex justify-between items-center px-8 py-4 border-t-4 border-black bg-gradient-to-r from-cyan-50 to-white flex-shrink-0 shadow-md">
+        <span className="flex items-center gap-3 font-mono text-xs font-black text-black uppercase tracking-widest">
           <span
             className={[
-              'inline-block w-[6px] h-[6px] rounded-full',
-              wsConnected ? 'bg-success animate-blink' : 'bg-muted',
+              'inline-block w-3 h-3 rounded-full',
+              wsConnected ? 'bg-lime-500 animate-pulse shadow-lg' : 'bg-gray-400',
             ].join(' ')}
           />
-          {wsLabel}
+          <span className="drop-shadow-sm">
+            {wsLabel}
+          </span>
         </span>
-        <span className="font-mono text-[10px] text-muted">
-          {wallet ? `Monad Testnet · ${shortAddr(wallet)}` : 'Monad Testnet'}
+        <span className="font-mono text-xs font-black text-black uppercase tracking-widest drop-shadow-sm">
+          {wallet ? `Monad · ${shortAddr(wallet)}` : 'Monad Testnet'}
         </span>
       </footer>
 
