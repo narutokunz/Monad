@@ -12,19 +12,27 @@ export default function JoinScreen({
   const [loading,  setLoading]  = useState(false)
   const [errorMsg, setErrorMsg] = useState('')
 
+  // timeLeft is null until first WS message arrives
+  const roundReady = timeLeft !== null && timeLeft !== undefined
+  const roundLive  = roundReady && timeLeft > 0
+
   const handleSubmit = async () => {
-    if (!wallet || submitted || loading || timeLeft === 0) return
+    if (!wallet || submitted || loading || !roundLive) return
     setLoading(true)
     setErrorMsg('')
     try {
       await onSubmit(choice)
     } catch (err) {
-      const msg = err?.shortMessage ?? err?.message ?? 'Unknown error'
-      if      (msg.includes('AlreadySubmitted'))    setErrorMsg('Already submitted this round.')
-      else if (msg.includes('RoundNotActive'))       setErrorMsg('Round just ended — wait for next one.')
-      else if (msg.includes('InsufficientStake'))    setErrorMsg('Need 0.001 MON minimum stake.')
-      else if (msg.includes('insufficient balance')) setErrorMsg('Not enough MON for gas + stake.')
-      else                                           setErrorMsg(msg.slice(0, 120))
+      // ethers v6 decodes custom errors into err.reason or err.errorName
+      const reason = err?.errorName ?? err?.reason ?? err?.shortMessage ?? err?.message ?? ''
+      if      (reason.includes('AlreadySubmitted'))         setErrorMsg('Already submitted this round.')
+      else if (reason.includes('RoundNotActive'))           setErrorMsg('Round expired — wait for the next one.')
+      else if (reason.includes('InsufficientStake'))        setErrorMsg('Need at least 0.001 MON to enter.')
+      else if (reason.includes('InvalidChoice'))            setErrorMsg('Choice must be between 1 and 100.')
+      else if (reason.includes('insufficient balance') ||
+               reason.includes('Signer had insufficient')) setErrorMsg('Not enough MON for gas + stake.')
+      else if (reason.includes('execution reverted'))       setErrorMsg('Round expired — wait for the next one.')
+      else setErrorMsg(reason.slice(0, 140) || 'Transaction failed.')
     } finally {
       setLoading(false)
     }
@@ -36,6 +44,9 @@ export default function JoinScreen({
 
   if (!wallet) {
     btnLabel    = 'Connect wallet to play'
+    btnDisabled = true
+  } else if (!roundReady) {
+    btnLabel    = 'Waiting for round data...'
     btnDisabled = true
   } else if (timeLeft === 0) {
     btnLabel    = 'Round ended — wait'
@@ -51,7 +62,7 @@ export default function JoinScreen({
     btnDisabled = false
   }
 
-  const isHot = timeLeft > 0 && timeLeft <= 10
+  const isHot = roundLive && timeLeft <= 10
 
   return (
     <div className="flex-1 grid place-items-center px-5 py-10">
