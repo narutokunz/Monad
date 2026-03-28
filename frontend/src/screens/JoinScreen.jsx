@@ -125,7 +125,7 @@ export default function JoinScreen({
               max={100}
               value={choice}
               onChange={e => setChoice(Number(e.target.value))}
-              disabled={submitted || loading || timeLeft === 0}
+              disabled={submitted || loading || !roundLive}
               className="w-full"
             />
             <div className="flex justify-between mt-2 font-mono text-[10px] text-muted">
