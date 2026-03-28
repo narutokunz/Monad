@@ -5,7 +5,20 @@ export const STAKE_ETH        = '0.001'
 export const GAS_LIMIT        = 300000n
 
 export const CONTRACT_ABI = [
+  // Write
   'function submit(uint8 choice) payable',
+
+  // Round views
+  'function currentRound() view returns (uint256)',
+  'function timeLeft() view returns (uint256)',
+  'function getRoundsLeft() view returns (uint256)',
+  'function getAccumulatedPot() view returns (uint256)',
+
+  // Game views
+  'function currentGame() view returns (uint256)',
+  'function roundsInGame() view returns (uint256)',
+  'function getGameInfo(uint256 gameId) view returns (uint256 gameId_, uint256 totalPot, address winner, uint32 winnerScore, bool finished)',
+
   // Custom errors — needed so ethers can decode revert reasons
   'error RoundNotActive()',
   'error AlreadySubmitted()',
