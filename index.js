@@ -23,20 +23,31 @@ const { createRoundManager } = require('./roundManager');
 // ─── Minimal ABI (only what the backend uses) ─────────────────────────────────
 
 const CONTRACT_ABI = [
-  // Events
+  // ── Events ──────────────────────────────────────────────────────────────────
   'event RoundStarted(uint256 indexed roundId, uint256 startTime)',
   'event MoveMade(uint256 indexed roundId, address indexed player, uint8 choice, uint32 score)',
   'event RoundSettled(uint256 indexed roundId, address indexed winner, uint256 prize, uint32 winnerScore)',
   'event ScoreUpdated(address indexed player, uint32 newScore, uint8 choice)',
+  'event RoundCompleted(uint256 indexed gameId, uint256 roundNumber, uint256 roundPot)',
+  'event GameStarted(uint256 indexed gameId)',
+  'event GameSettled(uint256 indexed gameId, address winner, uint256 totalPot, uint32 winnerScore)',
 
-  // View functions
+  // ── Round view functions ─────────────────────────────────────────────────────
   'function currentRound() external view returns (uint256)',
   'function timeLeft() external view returns (uint256)',
   'function getRoundInfo(uint256 roundId) external view returns (uint256 startTime, uint256 pot, uint256 playerCount, bool settled, address winner)',
   'function getLeaderboard(uint256 roundId) external view returns (address[], uint32[], uint8[])',
   'function getFingerprint(address player) external view returns (uint8[5] lastMoves, uint8 bufferIndex, uint8 moveCount, uint32 totalSum, uint32 unpredictScore, bool hasSubmitted, uint8 currentChoice)',
 
-  // Write functions (called by settler wallet only)
+  // ── Game view functions ──────────────────────────────────────────────────────
+  'function currentGame() external view returns (uint256)',
+  'function roundsInGame() external view returns (uint256)',
+  'function accumulatedPot() external view returns (uint256)',
+  'function getRoundsLeft() external view returns (uint256)',
+  'function getAccumulatedPot() external view returns (uint256)',
+  'function getGameInfo(uint256 gameId) external view returns (uint256 gameId_, uint256 totalPot, address winner, uint32 winnerScore, bool finished)',
+
+  // ── Write functions (settler wallet only) ───────────────────────────────────
   'function settleRound() external',
 ];
 

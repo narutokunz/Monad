@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-/// @title MimicWar — a round-based on-chain game where the most unpredictable player wins
-/// @notice Players submit a number 1-100 each round; winner is determined by unpredictability score
+/// @title  MimicWar — 5-Round Game System
+/// @notice Players submit a number 1-100 each round; scores accumulate across
+///         5 rounds; the most unpredictable player across the whole game wins
+///         the combined pot.
 contract MimicWar {
-    // ─── Constants ───────────────────────────────────────────────────────────────
 
+    // ─── Constants ────────────────────────────────────────────────────────────────
+
+    uint256 public constant TOTAL_ROUNDS   = 5;
     uint256 public constant ROUND_DURATION = 30;       // seconds per round
     uint256 public constant MIN_STAKE      = 0.001 ether;
     uint8   public constant HISTORY_SIZE   = 5;        // circular buffer length
@@ -22,15 +26,15 @@ contract MimicWar {
 
     // ─── Structs ──────────────────────────────────────────────────────────────────
 
-    /// @dev Per-player behavioral fingerprint, persists across rounds
+    /// @dev Per-player behavioral fingerprint — persists across all rounds and games
     struct Fingerprint {
-        uint8[5] lastMoves;     // circular buffer of last 5 choices
-        uint8    bufferIndex;   // next write position in the circular buffer
-        uint8    moveCount;     // total moves ever, capped at 255
-        uint32   totalSum;      // sum of all choices ever (for all-time mean)
-        uint32   unpredictScore;// current unpredictability score 0-1000
-        bool     hasSubmitted;  // submitted in the current round?
-        uint8    currentChoice; // choice made in the current round
+        uint8[5] lastMoves;      // circular buffer of last 5 choices
+        uint8    bufferIndex;    // next write position in circular buffer
+        uint8    moveCount;      // total moves ever, capped at 255
+        uint32   totalSum;       // sum of all choices (for all-time mean)
+        uint32   unpredictScore; // current unpredictability score 0-1000
+        bool     hasSubmitted;   // submitted in the current round?
+        uint8    currentChoice;  // choice made in the current round
     }
 
     struct Round {
@@ -38,7 +42,15 @@ contract MimicWar {
         uint256 pot;
         uint256 playerCount;
         bool    settled;
+        address winner;          // highest scorer this round (informational; prize deferred to game end)
+    }
+
+    struct Game {
+        uint256 gameId;
+        uint256 totalPot;
         address winner;
+        uint32  winnerScore;
+        bool    finished;
     }
 
     // ─── Events ───────────────────────────────────────────────────────────────────
@@ -47,26 +59,39 @@ contract MimicWar {
     event MoveMade(uint256 indexed roundId, address indexed player, uint8 choice, uint32 score);
     event RoundSettled(uint256 indexed roundId, address indexed winner, uint256 prize, uint32 winnerScore);
     event ScoreUpdated(address indexed player, uint32 newScore, uint8 choice);
+    event RoundCompleted(uint256 indexed gameId, uint256 roundNumber, uint256 roundPot);
+    event GameStarted(uint256 indexed gameId);
+    event GameSettled(uint256 indexed gameId, address winner, uint256 totalPot, uint32 winnerScore);
 
     // ─── Storage ──────────────────────────────────────────────────────────────────
 
-    mapping(address => Fingerprint) public fingerprints;
-    mapping(uint256 => Round)       public rounds;
-    mapping(uint256 => address[])   public roundPlayers;
+    mapping(address => Fingerprint)  public fingerprints;
+    mapping(uint256 => Round)        public rounds;
+    mapping(uint256 => address[])    public roundPlayers;
+    mapping(uint256 => Game)         public games;
+
+    // Per-game unique player list (used by _settleGame to find the overall winner)
+    mapping(uint256 => address[])                    private gamePlayers;
+    mapping(uint256 => mapping(address => bool))     private gamePlayerSeen;
+
     uint256 public currentRound;
+    uint256 public currentGame;
+    uint256 public roundsInGame;    // rounds completed so far in current game (0-5)
+    uint256 public accumulatedPot;  // total MON collected across rounds in current game
 
     // ─── Constructor ──────────────────────────────────────────────────────────────
 
     constructor() {
+        currentGame = 1;
+        games[1].gameId = 1;
+        emit GameStarted(1);
         _startNewRound();
     }
 
-    // ─── External: Player Action ─────────────────────────────────────────────────
+    // ─── External: Player Action ──────────────────────────────────────────────────
 
     /// @notice Submit a choice for the current round
-    /// @dev Parallel-safe: each caller writes only to their own Fingerprint slot;
-    ///      shared round fields (pot, playerCount) are updated atomically by the EVM.
-    /// @param choice A number in [1, 100]
+    /// @param  choice A number in [1, 100]
     function submit(uint8 choice) external payable {
         if (choice < 1 || choice > 100) revert InvalidChoice();
         if (msg.value < MIN_STAKE)       revert InsufficientStake();
@@ -78,93 +103,157 @@ contract MimicWar {
         Fingerprint storage fp = fingerprints[msg.sender];
         if (fp.hasSubmitted) revert AlreadySubmitted();
 
-        // Score is computed from history BEFORE updating it
+        // Score computed from history BEFORE updating it
         uint32 score = _calculateUnpredictability(fp, choice);
-
-        // Update persistent behavioral history
         _updateHistory(fp, choice);
 
-        // Record round-specific state
         fp.unpredictScore = score;
         fp.hasSubmitted   = true;
         fp.currentChoice  = choice;
 
-        // Update round bookkeeping
         round.pot         += msg.value;
         round.playerCount += 1;
         roundPlayers[currentRound].push(msg.sender);
+
+        // Track unique players per game for _settleGame()
+        if (!gamePlayerSeen[currentGame][msg.sender]) {
+            gamePlayerSeen[currentGame][msg.sender] = true;
+            gamePlayers[currentGame].push(msg.sender);
+        }
 
         emit MoveMade(currentRound, msg.sender, choice, score);
         emit ScoreUpdated(msg.sender, score, choice);
     }
 
-    // ─── External: Settlement ────────────────────────────────────────────────────
+    // ─── External: Settlement ─────────────────────────────────────────────────────
 
-    /// @notice Settle the current round, pick a winner, and start the next round
-    /// @dev Follows CEI: all state changes happen before the external payment call.
-    ///      New round is started before paying to prevent re-entrancy from affecting
-    ///      round state.
+    /// @notice Settle the current round and advance to the next one (or end the game)
+    /// @dev    Follows CEI: all state changes before external calls.
     function settleRound() external {
-        uint256 roundId   = currentRound;
+        uint256 roundId     = currentRound;
         Round storage round = rounds[roundId];
 
-        if (round.settled)                                      revert RoundAlreadySettled();
-        if (block.timestamp < round.startTime + ROUND_DURATION) revert RoundStillActive();
+        if (round.settled)                                       revert RoundAlreadySettled();
+        if (block.timestamp < round.startTime + ROUND_DURATION)  revert RoundStillActive();
 
         address[] storage players = roundPlayers[roundId];
 
-        // No players — mark settled and advance without paying anyone
+        // ── Empty round path ──────────────────────────────────────────────────────
         if (players.length == 0) {
             round.settled = true;
-            _startNewRound();
+            roundsInGame++;
             emit RoundSettled(roundId, address(0), 0, 0);
+
+            if (roundsInGame >= TOTAL_ROUNDS) {
+                _settleGame();
+            } else {
+                emit RoundCompleted(currentGame, roundsInGame, 0);
+                _startNewRound();
+            }
             return;
         }
 
-        // ── Find winner (highest unpredictability score; first occurrence wins ties) ──
-        address winner;
+        // ── Find round's top scorer (informational — prize deferred to game end) ──
+        address roundWinner;
         uint32  highestScore;
         uint256 count = players.length;
 
         for (uint256 i = 0; i < count; ) {
             address player = players[i];
             uint32  score  = fingerprints[player].unpredictScore;
-            if (winner == address(0) || score > highestScore) {
+            if (roundWinner == address(0) || score > highestScore) {
                 highestScore = score;
-                winner       = player;
+                roundWinner  = player;
             }
             unchecked { ++i; }
         }
 
-        uint256 prize = round.pot;
-
-        // ── Effects: mark settled, record winner ──────────────────────────────────
+        // ── Effects ───────────────────────────────────────────────────────────────
         round.settled = true;
-        round.winner  = winner;
+        round.winner  = roundWinner;
 
+        uint256 roundPot = round.pot;
+        accumulatedPot  += roundPot;
+        roundsInGame++;
 
-        // Reset per-round submission flags for all participants
+        // Reset per-round submission flags for all round participants
         for (uint256 i = 0; i < count; ) {
             fingerprints[players[i]].hasSubmitted = false;
             unchecked { ++i; }
         }
 
-        // Start next round BEFORE paying winner (re-entrancy protection)
-        _startNewRound();
+        emit RoundSettled(roundId, roundWinner, roundPot, highestScore);
 
-        // ── Interaction: pay winner ───────────────────────────────────────────────
-        // NOTE: If the winner's receive() reverts the entire transaction reverts,
-        // rolling back the settled flag. Consider a pull-payment upgrade for
-        // adversarial environments.
-        (bool ok, ) = winner.call{value: prize}("");
-        require(ok, "MimicWar: transfer failed");
-
-        emit RoundSettled(roundId, winner, prize, highestScore);
+        if (roundsInGame >= TOTAL_ROUNDS) {
+            _settleGame();
+        } else {
+            emit RoundCompleted(currentGame, roundsInGame, roundPot);
+            _startNewRound();
+        }
     }
 
-    // ─── External: View Helpers ──────────────────────────────────────────────────
+    // ─── Internal: Game Settlement ────────────────────────────────────────────────
 
-    /// @notice Returns all players, their unpredictability scores, and their choices for a round
+    /// @dev Finds the overall game winner (highest unpredictScore across all
+    ///      game participants), resets game state, then pays — CEI order.
+    function _settleGame() internal {
+        uint256 gameId = currentGame;
+        address[] storage allPlayers = gamePlayers[gameId];
+        uint256 count = allPlayers.length;
+
+        // ── No players in any round of this game ──────────────────────────────────
+        if (count == 0) {
+            games[gameId].finished = true;
+            emit GameSettled(gameId, address(0), 0, 0);
+
+            roundsInGame   = 0;
+            accumulatedPot = 0;
+            currentGame++;
+            games[currentGame].gameId = currentGame;
+            emit GameStarted(currentGame);
+            _startNewRound();
+            return;
+        }
+
+        // ── Find player with highest overall unpredictScore ───────────────────────
+        address gameWinner;
+        uint32  highestScore;
+
+        for (uint256 i = 0; i < count; ) {
+            address player = allPlayers[i];
+            uint32  score  = fingerprints[player].unpredictScore;
+            if (gameWinner == address(0) || score > highestScore) {
+                highestScore = score;
+                gameWinner   = player;
+            }
+            unchecked { ++i; }
+        }
+
+        uint256 prize = accumulatedPot;
+
+        // ── Effects: reset all game state BEFORE paying ───────────────────────────
+        games[gameId].finished    = true;
+        games[gameId].winner      = gameWinner;
+        games[gameId].totalPot    = prize;
+        games[gameId].winnerScore = highestScore;
+
+        roundsInGame   = 0;
+        accumulatedPot = 0;
+        currentGame++;
+        games[currentGame].gameId = currentGame;
+
+        emit GameSettled(gameId, gameWinner, prize, highestScore);
+        emit GameStarted(currentGame);
+        _startNewRound();
+
+        // ── Interaction: pay winner after all state is reset ──────────────────────
+        (bool ok, ) = gameWinner.call{value: prize}("");
+        require(ok, "MimicWar: transfer failed");
+    }
+
+    // ─── External: View Functions ─────────────────────────────────────────────────
+
+    /// @notice Leaderboard for a given round
     function getLeaderboard(uint256 roundId)
         external
         view
@@ -176,11 +265,9 @@ contract MimicWar {
     {
         address[] storage players = roundPlayers[roundId];
         uint256 n = players.length;
-
         addrs   = new address[](n);
         scores  = new uint32[](n);
         choices = new uint8[](n);
-
         for (uint256 i = 0; i < n; ) {
             address p  = players[i];
             addrs[i]   = p;
@@ -190,7 +277,7 @@ contract MimicWar {
         }
     }
 
-    /// @notice Returns the full behavioral fingerprint for a player
+    /// @notice Full behavioral fingerprint for a player
     function getFingerprint(address player)
         external
         view
@@ -216,7 +303,7 @@ contract MimicWar {
         );
     }
 
-    /// @notice Returns full round data for a given round ID
+    /// @notice Round data for a given round ID
     function getRoundInfo(uint256 roundId)
         external
         view
@@ -232,29 +319,51 @@ contract MimicWar {
         return (r.startTime, r.pot, r.playerCount, r.settled, r.winner);
     }
 
-    /// @notice Returns seconds remaining in the current round (0 if time has elapsed)
+    /// @notice Game data for a given game ID
+    function getGameInfo(uint256 gameId)
+        external
+        view
+        returns (
+            uint256 gameId_,
+            uint256 totalPot,
+            address winner,
+            uint32  winnerScore,
+            bool    finished
+        )
+    {
+        Game storage g = games[gameId];
+        return (g.gameId, g.totalPot, g.winner, g.winnerScore, g.finished);
+    }
+
+    /// @notice Seconds remaining in the current round
     function timeLeft() external view returns (uint256) {
         uint256 endTime = rounds[currentRound].startTime + ROUND_DURATION;
         if (block.timestamp >= endTime) return 0;
         return endTime - block.timestamp;
     }
 
+    /// @notice Rounds remaining in the current game (5 at game start, 0 after last round settles)
+    function getRoundsLeft() external view returns (uint256) {
+        return TOTAL_ROUNDS - roundsInGame;
+    }
+
+    /// @notice Total MON accumulated across all rounds in the current game
+    function getAccumulatedPot() external view returns (uint256) {
+        return accumulatedPot;
+    }
+
     // ─── Internal: Score Calculation ─────────────────────────────────────────────
 
-    /// @dev Computes the unpredictability score [0, 1000] from existing history + new choice.
-    ///      Called BEFORE _updateHistory so fp reflects only prior moves.
     function _calculateUnpredictability(Fingerprint storage fp, uint8 choice)
         internal
         view
         returns (uint32)
     {
-        // First move ever → baseline score
         if (fp.moveCount == 0) return 500;
 
         uint8 count = fp.moveCount < HISTORY_SIZE ? fp.moveCount : HISTORY_SIZE;
 
-        // ── Component 1: Variance score (0-400) ──────────────────────────────────
-        // Mean of the circular buffer (only valid entries)
+        // Component 1: Variance score (0-400)
         uint256 bufSum = 0;
         for (uint8 i = 0; i < count; ) {
             bufSum += fp.lastMoves[i];
@@ -272,22 +381,19 @@ contract MimicWar {
         uint256 variance      = varianceAcc / count;
         uint256 varianceScore = variance > 2500 ? 400 : (variance * 400) / 2500;
 
-        // ── Component 2: Surprise score (0-400) ──────────────────────────────────
-        uint256 allTimeMean = fp.totalSum / fp.moveCount; // safe: moveCount > 0
-        uint256 choiceVal   = uint256(choice);
-        uint256 surprise    = choiceVal > allTimeMean
+        // Component 2: Surprise score (0-400)
+        uint256 allTimeMean   = fp.totalSum / fp.moveCount;
+        uint256 choiceVal     = uint256(choice);
+        uint256 surprise      = choiceVal > allTimeMean
             ? choiceVal - allTimeMean
             : allTimeMean - choiceVal;
         uint256 surpriseScore = surprise > 49 ? 400 : (surprise * 400) / 49;
 
-        // ── Component 3: Anti-repeat penalty (-200) ───────────────────────────────
+        // Component 3: Anti-repeat penalty (0 or 200)
         uint256 repeatPenalty = 0;
         uint8 lastIdx = uint8((uint256(fp.bufferIndex) + HISTORY_SIZE - 1) % HISTORY_SIZE);
-        if (choice == fp.lastMoves[lastIdx]) {
-            repeatPenalty = 200;
-        }
+        if (choice == fp.lastMoves[lastIdx]) repeatPenalty = 200;
 
-        // ── Final: clamp to [0, 1000] ─────────────────────────────────────────────
         uint256 raw = varianceScore + surpriseScore;
         if (raw < repeatPenalty) return 0;
         raw -= repeatPenalty;
@@ -295,19 +401,17 @@ contract MimicWar {
         return uint32(raw);
     }
 
-    // ─── Internal: History Update ────────────────────────────────────────────────
+    // ─── Internal: History Update ─────────────────────────────────────────────────
 
-    /// @dev Appends `choice` to the circular buffer and updates summary statistics
     function _updateHistory(Fingerprint storage fp, uint8 choice) internal {
         fp.lastMoves[fp.bufferIndex] = choice;
         fp.bufferIndex = uint8((uint256(fp.bufferIndex) + 1) % HISTORY_SIZE);
         if (fp.moveCount < 255) fp.moveCount++;
-        fp.totalSum += uint32(choice); // totalSum accumulates unbounded; moveCount caps at 255
+        fp.totalSum += uint32(choice);
     }
 
-    // ─── Internal: Round Lifecycle ───────────────────────────────────────────────
+    // ─── Internal: Round Lifecycle ────────────────────────────────────────────────
 
-    /// @dev Increments currentRound and initialises the new Round entry
     function _startNewRound() internal {
         currentRound++;
         rounds[currentRound].startTime = block.timestamp;

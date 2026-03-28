@@ -2,8 +2,8 @@
 
 /**
  * test-game.js
- * Simulates multiple players submitting moves to MimicWar.
- * Run this while `npm start` is running in another terminal.
+ * Plays a full 5-round MimicWar game with 3 simulated players.
+ * Run while `npm start` is running in another terminal.
  *
  * Usage:  node test-game.js
  */
@@ -18,13 +18,25 @@ const ABI = [
   'function submit(uint8 choice) payable',
   'function timeLeft() view returns (uint256)',
   'function currentRound() view returns (uint256)',
+  'function currentGame() view returns (uint256)',
+  'function roundsInGame() view returns (uint256)',
+  'function getRoundsLeft() view returns (uint256)',
+  'function getAccumulatedPot() view returns (uint256)',
   'function getRoundInfo(uint256) view returns (uint256 startTime, uint256 pot, uint256 playerCount, bool settled, address winner)',
+  'function getGameInfo(uint256) view returns (uint256 gameId_, uint256 totalPot, address winner, uint32 winnerScore, bool finished)',
 ];
 
-const NUM_PLAYERS = 3;
-const STAKE       = ethers.parseEther('0.001');
-// Explicit gas limit — avoids eth_estimateGas which some Monad RPCs reject
-const GAS_LIMIT   = 300_000n;
+const STAKE     = ethers.parseEther('0.001');
+const GAS_LIMIT = 300_000n;
+
+// Different choices per round so scores are interesting
+const ROUND_CHOICES = [
+  [73, 12, 88],   // Round 1
+  [25, 91, 47],   // Round 2
+  [60, 33, 78],   // Round 3
+  [15, 82, 44],   // Round 4
+  [99,  5, 55],   // Round 5
+];
 
 function makeProvider() {
   return new ethers.JsonRpcProvider(
@@ -34,102 +46,157 @@ function makeProvider() {
   );
 }
 
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function waitForFreshRound(contract, minSeconds = 20n) {
+  while (true) {
+    try {
+      const [timeLeft, roundId, gameId, roundsIn, roundsLeft] = await Promise.all([
+        contract.timeLeft(),
+        contract.currentRound(),
+        contract.currentGame(),
+        contract.roundsInGame(),
+        contract.getRoundsLeft(),
+      ]);
+      const info = await contract.getRoundInfo(roundId);
+      console.log(
+        `  Round #${roundId} | Game #${gameId} | Round ${5 - Number(roundsLeft) + 1}/5 | ` +
+        `timeLeft: ${timeLeft}s | settled: ${info[3]}`
+      );
+      if (!info[3] && timeLeft >= minSeconds) return { roundId, gameId, roundsLeft };
+      const msg = timeLeft === 0n && !info[3]
+        ? 'waiting for backend to settle...'
+        : info[3]
+        ? 'round settled, waiting for next...'
+        : `only ${timeLeft}s left, waiting...`;
+      console.log(`    ⏳ ${msg}`);
+    } catch (err) {
+      console.log(`    ⏳ RPC error — retrying... (${err.shortMessage ?? err.message})`);
+    }
+    await sleep(5_000);
+  }
+}
+
 async function main() {
   const provider = makeProvider();
   const funder   = new ethers.Wallet(process.env.SETTLER_PRIVATE_KEY, provider);
-
-  console.log('\n══════════════════════════════════════');
-  console.log('  MimicWar — Test Game Runner');
-  console.log('══════════════════════════════════════');
-  console.log('Funder  :', funder.address);
-  console.log('Contract:', CONTRACT_ADDRESS);
-
-  // ── 1. Wait for a fresh round with enough time ───────────────────────────
   const contract = new ethers.Contract(CONTRACT_ADDRESS, ABI, provider);
 
-  let roundId, timeLeft, info;
-  console.log('');
-  while (true) {
-    try {
-      roundId  = await contract.currentRound();
-      timeLeft = await contract.timeLeft();
-      info     = await contract.getRoundInfo(roundId);
-      console.log(`Round #${roundId}  |  timeLeft: ${timeLeft}s  |  settled: ${info[3]}`);
+  console.log('\n╔══════════════════════════════════════════════════╗');
+  console.log('║     MimicWar — 5-Round Game Test Runner          ║');
+  console.log('╚══════════════════════════════════════════════════╝');
+  console.log(`Funder  : ${funder.address}`);
+  console.log(`Contract: ${CONTRACT_ADDRESS}\n`);
 
-      if (!info[3] && timeLeft >= 20n) break; // enough time — proceed
+  // ── Create 3 persistent test wallets ──────────────────────────────────────
+  const players = [
+    new ethers.Wallet('0x1111111111111111111111111111111111111111111111111111111111111111', provider),
+    new ethers.Wallet('0x2222222222222222222222222222222222222222222222222222222222222222', provider),
+    new ethers.Wallet('0x3333333333333333333333333333333333333333333333333333333333333333', provider),
+  ];
 
-      const waitMsg = timeLeft === 0n && !info[3]
-        ? 'Round expired, waiting for backend to settle and start next round...'
-        : info[3]
-        ? 'Round settled, waiting for next round to start...'
-        : `Only ${timeLeft}s left — waiting for next round...`;
-      console.log(`  ⏳ ${waitMsg}`);
-    } catch (err) {
-      console.log(`  ⏳ RPC error (${err.shortMessage ?? err.message ?? 'unknown'}) — retrying...`);
-    }
-    await new Promise(r => setTimeout(r, 5_000)); // poll every 5s
-  }
-
-  // ── 2. Create and fund test wallets ──────────────────────────────────────
-  console.log(`\nCreating ${NUM_PLAYERS} test players...`);
-  const players = [];
-  for (let i = 0; i < NUM_PLAYERS; i++) {
-    players.push(ethers.Wallet.createRandom().connect(provider));
-  }
-
-  const fundAmount = ethers.parseEther('0.05'); // stake + gas headroom
-  console.log(`Funding each player with ${ethers.formatEther(fundAmount)} MON...`);
-
-  for (const player of players) {
-    const tx = await funder.sendTransaction({
-      to:       player.address,
-      value:    fundAmount,
-      gasLimit: 21_000n,
-    });
-    await tx.wait();
-    console.log(`  ✔ Funded ${player.address}`);
-  }
-
-  // ── 3. Re-check time before submitting ───────────────────────────────────
-  const timeLeftNow = await contract.timeLeft();
-  if (timeLeftNow < 5n) {
-    console.log(`⚠  Ran out of time during funding (${timeLeftNow}s left). Re-run for next round.`);
-    return;
-  }
-
-  // ── 4. Each player submits a different choice ─────────────────────────────
-  const choices = [73, 12, 88];
-  console.log('\nSubmitting moves...');
-
+  // ── Check balances, fund if needed ────────────────────────────────────────
+  console.log('Checking player balances...');
+  const fundAmount = ethers.parseEther('0.05');
   for (let i = 0; i < players.length; i++) {
-    const playerContract = new ethers.Contract(CONTRACT_ADDRESS, ABI, players[i]);
-    const choice = choices[i] ?? Math.floor(Math.random() * 100) + 1;
-    try {
-      const tx = await playerContract.submit(choice, {
-        value:    STAKE,
-        gasLimit: GAS_LIMIT,
-      });
-      console.log(`  Player ${i + 1} (${players[i].address.slice(0, 8)}…) submitted ${choice} → tx: ${tx.hash}`);
-      const receipt = await tx.wait();
-      console.log(`  ✔ Confirmed in block ${receipt.blockNumber}`);
-    } catch (err) {
-      // Print full error detail for debugging
-      console.error(`  ✗ Player ${i + 1} failed:`);
-      console.error('    shortMessage:', err.shortMessage);
-      console.error('    message     :', err.message?.slice(0, 200));
-      console.error('    code        :', err.code);
-      if (err.info) console.error('    info        :', JSON.stringify(err.info).slice(0, 300));
+    const bal = await provider.getBalance(players[i].address);
+    if (bal < ethers.parseEther('0.01')) {
+      process.stdout.write(`  Funding player ${i + 1} (${players[i].address.slice(0, 8)}…)... `);
+      const tx = await funder.sendTransaction({ to: players[i].address, value: fundAmount, gasLimit: 21_000n });
+      await tx.wait();
+      console.log('✔');
+    } else {
+      console.log(`  Player ${i + 1} (${players[i].address.slice(0, 8)}…) has ${ethers.formatEther(bal)} MON ✔`);
     }
   }
 
-  // ── 5. Show updated round state ───────────────────────────────────────────
-  const updated = await contract.getRoundInfo(roundId);
-  console.log(`\nRound #${roundId} — ${updated[2]} player(s) | pot: ${ethers.formatEther(updated[1])} MON | timeLeft: ${await contract.timeLeft()}s`);
-  console.log('\n✔ Done! Watch the backend terminal for live output.');
-  console.log('  The backend auto-calls settleRound() when the 30s timer expires.\n');
+  // ── Play up to 5 rounds ───────────────────────────────────────────────────
+  let startGame = null;
+
+  for (let roundNum = 1; roundNum <= 5; roundNum++) {
+    console.log(`\n${'─'.repeat(52)}`);
+    console.log(`ROUND ${roundNum}/5`);
+    console.log('─'.repeat(52));
+
+    // Wait for a round with enough time
+    const { roundId, gameId, roundsLeft } = await waitForFreshRound(contract, 20n);
+
+    // On first round, record which game we're in
+    if (startGame === null) {
+      startGame = gameId;
+      console.log(`\n  Starting game #${gameId}`);
+    }
+
+    // If game changed mid-test, keep going (backend settled early)
+    console.log(`  Submitting in round #${roundId} (game #${gameId})...`);
+
+    const choices = ROUND_CHOICES[roundNum - 1];
+    for (let i = 0; i < players.length; i++) {
+      const playerContract = new ethers.Contract(CONTRACT_ADDRESS, ABI, players[i]);
+      const choice = choices[i];
+      try {
+        const tx = await playerContract.submit(choice, { value: STAKE, gasLimit: GAS_LIMIT });
+        process.stdout.write(`  Player ${i + 1} submitted ${choice}... `);
+        await tx.wait();
+        console.log('✔');
+      } catch (err) {
+        const reason = err.shortMessage ?? err.message ?? '';
+        if (reason.includes('AlreadySubmitted')) {
+          console.log(`  Player ${i + 1} already submitted this round — skipping`);
+        } else {
+          console.error(`  Player ${i + 1} FAILED: ${reason.slice(0, 120)}`);
+        }
+      }
+    }
+
+    const pot = await contract.getAccumulatedPot();
+    console.log(`  Accumulated pot so far: ${ethers.formatEther(pot)} MON`);
+
+    if (roundNum < 5) {
+      console.log('\n  Waiting for backend to settle this round and start the next...');
+      // Wait until roundsInGame increases (backend settled)
+      const prevRoundsIn = 5 - Number(roundsLeft);
+      while (true) {
+        await sleep(6_000);
+        try {
+          const newRoundsIn = Number(await contract.roundsInGame());
+          if (newRoundsIn > prevRoundsIn || newRoundsIn === 0) break;
+          process.stdout.write('.');
+        } catch (_) {}
+      }
+      console.log('');
+    }
+  }
+
+  // ── Wait for final game settlement ────────────────────────────────────────
+  console.log(`\n${'═'.repeat(52)}`);
+  console.log('All 5 rounds submitted — waiting for game settlement...');
+  console.log('═'.repeat(52));
+
+  while (true) {
+    await sleep(8_000);
+    try {
+      const gameId = startGame ?? (await contract.currentGame()) - 1n;
+      const info   = await contract.getGameInfo(gameId);
+      if (info.finished) {
+        console.log('\n✔ GAME SETTLED!');
+        console.log(`  Game     : #${info.gameId_}`);
+        console.log(`  Winner   : ${info.winner}`);
+        console.log(`  Prize    : ${ethers.formatEther(info.totalPot)} MON`);
+        console.log(`  Score    : ${info.winnerScore} pts`);
+        break;
+      }
+      const roundsIn = await contract.roundsInGame();
+      process.stdout.write(`  Rounds settled: ${roundsIn}/5... `);
+    } catch (err) {
+      process.stdout.write('(RPC error — retrying) ');
+    }
+  }
+
+  console.log('\n✔ Full game test complete! Check the frontend end screen.\n');
 }
 
 main().catch((err) => {
-  console.error('[FATAL]', err.shortMessage ?? err.message);
+  console.error('[FATAL]', err.shortMessage ?? err.message ?? err);
   process.exit(1);
 });
