@@ -134,19 +134,28 @@ async function main() {
     for (let i = 0; i < players.length; i++) {
       const playerContract = new ethers.Contract(CONTRACT_ADDRESS, ABI, players[i]);
       const choice = choices[i];
-      try {
-        const tx = await playerContract.submit(choice, { value: STAKE, gasLimit: GAS_LIMIT });
-        process.stdout.write(`  Player ${i + 1} submitted ${choice}... `);
-        await tx.wait();
-        console.log('✔');
-      } catch (err) {
-        const reason = err.shortMessage ?? err.message ?? '';
-        if (reason.includes('AlreadySubmitted')) {
-          console.log(`  Player ${i + 1} already submitted this round — skipping`);
-        } else {
-          console.error(`  Player ${i + 1} FAILED: ${reason.slice(0, 120)}`);
+      let retries = 3;
+      while (retries > 0) {
+        try {
+          const tx = await playerContract.submit(choice, { value: STAKE, gasLimit: GAS_LIMIT });
+          console.log(`  Player ${i + 1} submitted ${choice} → tx: ${tx.hash.slice(0, 18)}…`);
+          break; // sent successfully — don't wait for receipt to avoid polling
+        } catch (err) {
+          const reason = err.shortMessage ?? err.message ?? '';
+          if (reason.includes('AlreadySubmitted')) {
+            console.log(`  Player ${i + 1} already submitted — skipping`);
+            break;
+          } else if (reason.includes('coalesce') || reason.includes('rate limit') || reason.includes('limit reached')) {
+            retries--;
+            console.log(`  Player ${i + 1} rate limited — waiting 4s (${retries} retries left)...`);
+            await sleep(4_000);
+          } else {
+            console.error(`  Player ${i + 1} FAILED: ${reason.slice(0, 120)}`);
+            break;
+          }
         }
       }
+      await sleep(3_000); // 3s gap between each player to avoid rate limits
     }
 
     const pot = await contract.getAccumulatedPot();
