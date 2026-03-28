@@ -30,7 +30,7 @@ function makeProvider() {
   return new ethers.JsonRpcProvider(
     RPC_URL,
     { chainId: 10143, name: 'monad-testnet' },
-    { polling: true, pollingInterval: 2_000 },
+    { polling: false },
   );
 }
 
@@ -50,19 +50,23 @@ async function main() {
   let roundId, timeLeft, info;
   console.log('');
   while (true) {
-    roundId  = await contract.currentRound();
-    timeLeft = await contract.timeLeft();
-    info     = await contract.getRoundInfo(roundId);
-    console.log(`Round #${roundId}  |  timeLeft: ${timeLeft}s  |  settled: ${info[3]}`);
+    try {
+      roundId  = await contract.currentRound();
+      timeLeft = await contract.timeLeft();
+      info     = await contract.getRoundInfo(roundId);
+      console.log(`Round #${roundId}  |  timeLeft: ${timeLeft}s  |  settled: ${info[3]}`);
 
-    if (!info[3] && timeLeft >= 20n) break; // enough time — proceed
+      if (!info[3] && timeLeft >= 20n) break; // enough time — proceed
 
-    const waitMsg = timeLeft === 0n && !info[3]
-      ? 'Round expired, waiting for backend to settle and start next round...'
-      : info[3]
-      ? 'Round settled, waiting for next round to start...'
-      : `Only ${timeLeft}s left — waiting for next round...`;
-    console.log(`  ⏳ ${waitMsg}`);
+      const waitMsg = timeLeft === 0n && !info[3]
+        ? 'Round expired, waiting for backend to settle and start next round...'
+        : info[3]
+        ? 'Round settled, waiting for next round to start...'
+        : `Only ${timeLeft}s left — waiting for next round...`;
+      console.log(`  ⏳ ${waitMsg}`);
+    } catch (err) {
+      console.log(`  ⏳ RPC error (${err.shortMessage ?? err.message ?? 'unknown'}) — retrying...`);
+    }
     await new Promise(r => setTimeout(r, 5_000)); // poll every 5s
   }
 

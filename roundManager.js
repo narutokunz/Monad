@@ -57,7 +57,7 @@ function createRoundManager(contract, signerContract, state) {
 
       console.log(`[ROUND MANAGER] Round ${state.currentRound} has expired — sending settleRound()...`);
 
-      const tx = await signerContract.settleRound({ gasLimit: 500_000n });
+      const tx = await signerContract.settleRound({ gasLimit: 1_000_000n });
       console.log(`[ROUND MANAGER] tx submitted → ${tx.hash}`);
 
       const receipt = await tx.wait();
