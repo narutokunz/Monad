@@ -1,0 +1,14 @@
+{
+  "name": "mimicwar-hardhat",
+  "version": "1.0.0",
+  "description": "Hardhat deployment for MimicWar on Monad testnet",
+  "scripts": {
+    "compile": "hardhat compile",
+    "deploy": "hardhat run scripts/deploy.js --network monad",
+    "verify": "hardhat verify --network monad"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "hardhat": "^2.22.0"
+  }
+}
